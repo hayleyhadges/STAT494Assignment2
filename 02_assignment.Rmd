@@ -1,0 +1,501 @@
+---
+title: 'Assignment #2'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r libraries}
+# SEE modeldata package for new datasets
+library(tidyverse)         # for graphing and data cleaning
+library(tidymodels)        # for modeling
+library(stacks)            # for stacking models
+library(naniar)            # for examining missing values (NAs)
+library(lubridate)         # for date manipulation
+library(moderndive)        # for King County housing data
+library(vip)               # for variable importance plots
+library(DALEX)             # for model interpretation  
+library(DALEXtra)          # for extension of DALEX
+library(patchwork)         # for combining plots nicely
+library(pROC)
+theme_set(theme_minimal()) # Lisa's favorite theme
+```
+
+```{r data}
+data("lending_club")
+# Data dictionary (as close as I could find): https://www.kaggle.com/wordsforthewise/lending-club/discussion/170691
+```
+
+
+When you finish the assignment, remove the `#` from the options chunk at the top, so that messages and warnings aren't printed. If you are getting errors in your code, add `error = TRUE` so that the file knits. I would recommend not removing the `#` until you are completely finished.
+
+## Put it on GitHub!        
+
+From now on, GitHub should be part of your routine when doing assignments. I recommend making it part of your process anytime you are working in R, but I'll make you show it's part of your process for assignments.
+
+**Task**: When you are finished with the assignment, post a link below to the GitHub repo for the assignment. If you want to post it to your personal website, that's ok (not required). Make sure the link goes to a spot in the repo where I can easily find this assignment. For example, if you have a website with a blog and post the assignment as a blog post, link to the post's folder in the repo. As an example, I've linked to my GitHub stacking material [here](https://github.com/llendway/ads_website/tree/master/_posts/2021-03-22-stacking).
+
+[GitHub Repo](https://github.com/hayleyhadges/STAT494Assignment2)
+
+## Modeling
+
+Before jumping into these problems, you should read through (and follow along with!) the [model stacking](https://advanced-ds-in-r.netlify.app/posts/2021-03-22-stacking/) and [global model interpretation](https://advanced-ds-in-r.netlify.app/posts/2021-03-24-imlglobal/) tutorials on the Course Materials tab of the course website.
+
+We'll be using the `lending_club` dataset from the `modeldata` library, which is part of `tidymodels`. The data dictionary they reference doesn't seem to exist anymore, but it seems the one on this [kaggle discussion](https://www.kaggle.com/wordsforthewise/lending-club/discussion/170691) is pretty close. It might also help to read a bit about [Lending Club](https://en.wikipedia.org/wiki/LendingClub) before starting in on the exercises.
+
+The outcome we are interested in predicting is `Class`. And according to the dataset's help page, its values are "either 'good' (meaning that the loan was fully paid back or currently on-time) or 'bad' (charged off, defaulted, of 21-120 days late)".
+
+**Tasks:** I will be expanding these, but this gives a good outline.
+
+1. Explore the data, concentrating on examining distributions of variables and examining missing values. 
+
+There are no NA values in the data.
+
+```{r}
+lending_club %>% 
+ select(everything()) %>% 
+  summarise_all(funs(sum(is.na(.))))
+```
+
+
+It looks like a majority of the numeric variables are right skewed. I can see why Lisa decided to add more 'bad' cases to the data.
+
+```{r, fig.width=12, fig.height= 10}
+lending_club %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram()
+
+lending_club %>% 
+  select(where(is.factor)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "variable", 
+               values_to = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_bar() +
+  facet_wrap(vars(variable), 
+             scales = "free", 
+             nrow = 2) 
+```
+
+2. Do any data cleaning steps that need to happen before the model is build. For example, you might remove any variables that mean the same thing as the response variable (not sure if that happens here), get rid of rows where all variables have missing values, etc. 
+
+```{r}
+lending_club <-
+lending_club %>% 
+  select(-delinq_amnt, -acc_now_delinq)
+```
+
+Be sure to add more "bad" Classes. This is not the best solution, but it will work for now. (Should investigate how to appropriately use `step_sample_up()` function from [`themis`](https://github.com/tidymodels/themis)).
+
+```{r}
+set.seed(494)
+create_more_bad <- lending_club %>% 
+  filter(Class == "bad") %>% 
+  sample_n(size = 3000, replace = TRUE)
+
+lending_club_mod <- lending_club %>% 
+  bind_rows(create_more_bad)
+```
+
+3. Split the data into training and test, putting 75\% in the training data.
+
+```{r}
+set.seed(494) # for reproducibility
+
+lending_split <- initial_split(lending_club_mod, 
+                             prop = .75, strata = Class)
+
+lending_training <- training(lending_split)
+lending_testing <- testing(lending_split)
+```
+
+4. Set up the recipe and the pre-processing steps to build a lasso model. Some steps you should take:
+
+* Make all integer variables numeric (I'd highly recommend using `step_mutate_at()` or this will be a lot of code). We'll want to do this for the model interpretation we'll do later.  
+* Think about grouping factor variables with many levels.  
+* Make categorical variables dummy variables (make sure NOT to do this to the outcome variable).  
+* Normalize quantitative variables.  
+
+```{r}
+lending_recipe <-
+  recipe(formula = Class ~ ., 
+         data = lending_training) %>% 
+  step_mutate_at(all_numeric(), fn = ~as.numeric(.)) %>% 
+  step_mutate(verification_status = as.factor(ifelse(verification_status == "Not_Verified", "Not_Verified", "Verified")),
+              sub_grade = fct_collapse(sub_grade,
+                    A = c("A1", "A2", "A3", "A4", "A5"),
+                    B = c("B1", "B2", "B3", "B4", "B5"),
+                    C = c("C1", "C2", "C3", "C4", "C5"),
+                    D = c("D1", "D2", "D3", "D4", "D5"),
+                    E = c("E1", "E2", "E3", "E4", "E5"),
+                    f = c("F1", "F2", "F3", "F4", "F5"),
+                    G = c("G1", "G2", "G3", "G4", "G5")),
+              addr_state = fct_collapse(addr_state,
+                    Midwest = c("ND", "SD", "NE", "KS", "MN", "WI", "IL", "IN", "MI", "OH", "MO"),
+                    South = c("OK", "TX", "AR", "LA", "MS", "AL", "GA", "FL", "TN", "KY", "SC", "NC", "VA", "WV", "MD", "DE", "DC"),
+                    Northeast = c("NY", "PA", "NJ", "CT", "VT", "MA", "NH", "ME", "RI"),
+                    West = c("WA", "OR", "CA", "MT", "ID", "WY", "NV", "UT", "AZ", "CO", "NM"),
+                    Pacific = c("HI"))) %>% 
+  step_dummy(all_nominal(), 
+             -all_outcomes()) %>% 
+  step_normalize(all_numeric())
+
+
+lending_recipe %>% 
+  prep(lending_training) %>%
+  juice() 
+```
+
+
+5. Set up the lasso model and workflow. We will tune the `penalty` parameter.
+
+```{r}
+lending_lasso_mod <- 
+  logistic_reg(mixture = 1) %>% 
+  set_engine("glmnet") %>% 
+  set_args(penalty = tune()) %>% 
+  set_mode("classification")
+
+lending_lasso_wf <- 
+  workflow() %>% 
+  add_recipe(lending_recipe) %>% 
+  add_model(lending_lasso_mod)
+
+
+penalty_grid <- grid_regular(penalty(),
+                             levels = 10)
+```
+
+6. Set up the model tuning for the `penalty` parameter. Be sure to add the `control_stack_grid()` for the `control` argument so we can use these results later when we stack. Find the accuracy and area under the roc curve for the model with the best tuning parameter.  Use 5-fold cv.
+
+Penalty = 4.641589e-04, accuracy = 0.7483136, roc_auc = 0.7589758
+
+```{r}
+set.seed(494) #for reproducible 5-fold
+
+lending_cv <- vfold_cv(lending_training, v = 5)
+
+ctrl_grid <- control_stack_grid()
+
+metric <- metric_set(accuracy)
+
+
+lending_lasso_tune <- 
+  lending_lasso_wf %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = penalty_grid,
+    control = ctrl_grid
+    )
+
+lending_lasso_tune%>% 
+  collect_metrics() 
+```
+
+
+7. Set up the recipe and the pre-processing steps to build a random forest model. You shouldn't have to do as many steps. The only step you should need to do is making all integers numeric. 
+
+```{r}
+lending_rf_recipe <-
+  recipe(formula = Class ~ ., 
+         data = lending_training) %>% 
+  step_mutate_at(all_numeric(), fn = ~as.numeric(.))
+```
+
+8. Set up the random forest model and workflow. We will tune the `mtry` and `min_n` parameters and set the number of trees, `trees`, to 100 (otherwise the next steps take too long).
+
+```{r}
+lending_rf_spec <- 
+  rand_forest(mtry = tune(), 
+              min_n = tune(), 
+              trees = 100) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+lending_rf_wf <- 
+  workflow() %>% 
+  add_recipe(lending_rf_recipe) %>% 
+  add_model(lending_rf_spec) 
+```
+
+9. Set up the model tuning for both the `mtry` and `min_n` parameters. Be sure to add the `control_stack_grid()` for the `control` argument so we can use these results later when we stack. Use only 3 levels in the grid. For the `mtry` parameter, you need to put `finalize(mtry(), lending_training %>% select(-Class))` in as an argument instead of just `mtry()`, where `lending_training` is the name of your training data. This is because the `mtry()` grid will otherwise have unknowns in it. This part can take a while to run.
+
+```{r}
+mtry_grid <- grid_regular(finalize(mtry(), lending_training %>% select(-Class)), min_n(),
+                             levels = 3)
+
+lending_rf_tune <- 
+  lending_rf_wf %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = mtry_grid,
+    control = ctrl_grid
+    )
+```
+
+10. Find the best tuning parameters. What is the are the accuracy and area under the ROC curve for the model with those tuning parameters?
+
+The metric with the highest accuracy is mtry = 10 and min_n = 2, with an accuracy of 0.9928452 and an area under the ROC curve of 0.9972089.	
+```{r}
+lending_rf_tune%>% 
+  collect_metrics() 
+```
+
+EXTRA: Set up the finalized random forest model and workflow, then fit the finalized model. (for question 11)
+
+```{r}
+final_rf_spec <- 
+  rand_forest(mtry = 10, 
+              min_n = 2, 
+              trees = 100) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+final_rf_wf <- 
+  workflow() %>% 
+  add_recipe(lending_rf_recipe) %>% 
+  add_model(final_rf_spec) 
+```
+
+```{r}
+rf_fit <- final_rf_wf %>% 
+  fit(lending_training)
+```
+
+EXTRA: 
+
+```{r}
+ctrl_res <- control_stack_resamples()
+
+ranger_cv <- final_rf_wf %>% 
+  fit_resamples(lending_cv, 
+                control = ctrl_res)
+
+collect_metrics(ranger_cv)
+```
+
+11. Use functions from the `DALEX` and `DALEXtra` libraries to create a histogram and boxplot of the residuals from the training data. How do they look? Any interesting behavior?
+
+The residuals are skewed to the right, although its mode is at 0 the mean residual would be greater than 0 (which can be seen in the boxplots). 
+
+```{r}
+rf_explain <- 
+  explain_tidymodels(
+    model = rf_fit,
+    data = lending_training %>% select(-Class), 
+    y =lending_training %>% 
+      mutate(Class_num = as.integer(Class =="good")) %>% 
+      pull(Class_num),
+    label = "rf"
+  )
+
+rf_mod_perf <-  model_performance(rf_explain)
+
+hist_plot <- 
+  plot(rf_mod_perf,
+       rf_mod_perf, 
+       geom = "histogram")
+box_plot <-
+  plot(rf_mod_perf,
+       rf_mod_perf, 
+       geom = "boxplot")
+
+hist_plot
+box_plot
+```
+
+12. Use `DALEX` functions to create a variable importance plot from this model. What are the most important variables?
+
+The int_rate, annuak_inc, all_util, sub_grade, revol_util, and emp_length are the most important variables in the random forest model.
+
+```{r}
+set.seed(494)
+rf_var_imp <- 
+  model_parts(
+    rf_explain
+    )
+
+plot(rf_var_imp, show_boxplots = TRUE)
+```
+
+13. Write a function called `cp_profile` to make a CP profile. The function will take an explainer, a new observation, and a variable name as its arguments and create a CP profile for a quantitative predictor variable. You will need to use the `predict_profile()` function inside the function you create - put the variable name there so the plotting part is easier. You'll also want to use `aes_string()` rather than `aes()` and quote the variables. Use the `cp_profile()` function to create one CP profile of your choosing. Be sure to choose a variable that is numeric, not integer. There seem to be issues with those that I'm looking into.
+
+```{r}
+cp_profile <- function(explainer, new_obs, var) {
+  cp <-
+    predict_profile(explainer = explainer, 
+                          new_observation = new_obs, variables = var)
+  cp %>% 
+  rename(yhat = `_yhat_`) %>% 
+  ggplot(aes_string(x = var,
+             y = "yhat")) +
+  geom_line() 
+}
+
+ob <- 
+  lending_testing %>% 
+  slice(4)
+
+cp_profile(rf_explain, ob, "int_rate")
+```
+
+For an extra challenge, write a function that will work for either a quantitative or categorical variable. 
+
+If you need help with function writing check out the [Functions](https://r4ds.had.co.nz/functions.html) chapter of R4DS by Wickham and Grolemund.
+
+
+14. Use `DALEX` functions to create partial dependence plots (with the CP profiles in gray) for the 3-4 most important variables. If the important variables are categorical, you can instead make a CP profile for 3 observations in the dataset and discuss how you could go about constructing a partial dependence plot for a categorical variable (you don't have to code it, but you can if you want an extra challenge). If it ever gives you an error that says, "Error: Can't convert from `VARIABLE` <double> to `VARIABLE` <integer> due to loss of precision", then remove that variable from the list. I seem to have figured out why it's doing that, but I don't know how to fix it yet.
+
+```{r}
+set.seed(494)
+rf_pdp <- model_profile(explainer = rf_explain, variables = "annual_inc")
+
+plot(rf_pdp, 
+     variables = "annual_inc",
+     geom = "profiles")
+
+
+rf_pdp2 <- model_profile(explainer = rf_explain, variables = "int_rate")
+
+plot(rf_pdp2, 
+     variables = "int_rate",
+     geom = "profiles")
+
+rf_pdp3 <- model_profile(explainer = rf_explain, variables = "revol_util")
+
+plot(rf_pdp3, 
+     variables = "revol_util",
+     geom = "profiles")
+```
+
+15. Fit one more model type of your choosing that will feed into the stacking model. 
+
+```{r}
+knn_mod <-
+  nearest_neighbor(
+    neighbors = tune("k")
+  ) %>%
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+knn_wf <- 
+  workflow() %>% 
+  add_model(knn_mod) %>%
+  add_recipe(lending_rf_recipe)
+
+knn_tune <- 
+  knn_wf %>% 
+  tune_grid(
+    lending_cv,
+    grid = 4,
+    control = ctrl_grid
+  )
+```
+
+16. Create a model stack with the candidate models from the previous parts of the exercise and use the `blend_predictions()` function to find the coefficients of the stacked model. Create a plot examining the performance metrics for the different penalty parameters to assure you have captured the best one. If not, adjust the penalty. (HINT: use the `autoplot()` function). Which models are contributing most?
+
+The random forest model is contributing the most, with the knn model contributing a little and the lasso model not included in the stack model at all.
+
+```{r}
+lending_stack <- 
+  stacks() %>% 
+  add_candidates(ranger_cv) %>% 
+  add_candidates(lending_lasso_tune) %>% 
+  add_candidates(knn_tune)
+```
+
+```{r}
+lending_blend <- 
+  lending_stack %>% 
+  blend_predictions()
+
+lending_blend
+
+autoplot(lending_blend)
+```
+
+17. Fit the final stacked model using `fit_members()`. Apply the model to the test data and report the accuracy and area under the curve. Create a graph of the ROC and construct a confusion matrix. Comment on what you see. Save this final model using the `saveRDS()` function - see the [Use the model](https://advanced-ds-in-r.netlify.app/posts/2021-03-16-ml-review/#use-the-model) section of the `tidymodels` intro. We are going to use the model in the next part. You'll want to save it in the folder where you create your shiny app.
+
+The stacked model looks incredibly accurate.
+
+```{r}
+lending_final_stack <- lending_blend %>% 
+  fit_members()
+
+saveRDS(lending_final_stack, "final_mod.rds")
+```
+
+```{r}
+preds <-
+lending_testing %>% 
+  bind_cols(lending_final_stack %>% 
+  predict(new_data = lending_testing)) %>% 
+  bind_cols(lending_final_stack %>% 
+  predict(new_data = lending_testing, type = "prob"))
+
+preds
+```
+
+```{r}   
+conf_mat(data = preds, estimate = .pred_class, truth = Class)
+
+roc = roc(response = preds$Class, predictor = preds$.pred_good)
+plot(roc)
+```
+
+
+## Shiny app
+
+If you are new to Shiny apps or it's been awhile since you've made one, visit the Shiny links on our course [Resource](https://advanced-ds-in-r.netlify.app/resources.html) page. I would recommend starting with my resource because it will be the most basic. You won't be doing anything super fancy in this app. 
+
+Everyone should watch the [Theming Shiny](https://youtu.be/b9WWNO4P2nY) talk by Carson Sievert so you can make your app look amazing.
+
+**Tasks:**
+
+You are going to create an app that allows a user to explore how the predicted probability of a loan being paid back (or maybe just the predicted class - either "good" or "bad") changes depending on the values of the predictor variables.
+
+Specifically, you will do the following:
+
+* Set up a separate project and GitHub repo for this app. Make sure the saved model from the previous problem is also in that folder. The app needs to be created in a file called *exactly* app.R that is also in the project folder.   
+* At the top of the file, load any libraries you use in the app.  
+* Use the `readRDS()` function to load the model.  
+* You may want to load some of the data to use
+* Create a user interface (using the various `*Input()` functions) where someone could enter values for each variable that feeds into the model. You will want to think hard about which types of `*Input()` functions to use. Think about how you can best prevent mistakes (eg. entering free text could lead to many mistakes). 
+* Another part of the user interface will allow them to choose a variable (you can limit this to only the quantitative variables) where they can explore the effects of changing that variable, holding all others constant.  
+* After the user has entered all the required values, the output will be a CP profile with the the predicted value for the data that was entered, indicated by a point. I don't think the functions from `DALEX` and `DALEXtra` will work with a stacked model, so you'll likely have to (get to) do some of your own coding. 
+* Use the `bslib` to theme your shiny app!  
+* Publish your app to [shinyapps.io](https://www.shinyapps.io/). There are instructions for doing that on the tutorial I linked to above.   
+* Write a paragraph or two describing your app on your website! Link to the app and your GitHub repository in your post. Include a link to your post here. 
+
+I didn't want to put the app on my website since it's not as complete as I'd like it to be and I couldn't figure out how to fix the deployment error.
+
+[Shiny App](https://hayleyhadges.shinyapps.io/STAT494Assignment2App/)
+
+
+## Coded Bias
+
+Watch the [Code Bias](https://www.pbs.org/independentlens/films/coded-bias/) film and write a short reflection. If you want some prompts, reflect on: What part of the film impacted you the most? Was there a part that surprised you and why? What emotions did you experience while watching?
+
+
+These kinds of movies and documentaries work to shock and scare the public into action, and to question the status quo. This movie did a good job of this by showing possible bleak futures through what is going on in other parts in the world like China. I’ve seen a video or two about the surveillance and advanced AI technology in use in China, but hearing about it never fails to shock me because it sounds like something that would be in a science fiction novel. The credit system instituted that works to control behavior and speech there is mind boggling, but what is worse is how similar the situation is in the US, but just more under wraps. 
+
+Illustrating that the beginning steps to those futures are already being taken domestically is also scary. One example of this is the large number of people in the US (over 117 million) that have their face in a facial recognition network that can be searched by police unwarranted, even without any accuracy audits. With the possibility of state surveillance through such software becoming a principal asset for an authoritarian regime lies on one side, and corporate surveillance that disregards any idea of privacy on the other--AI technology is quite literally a weapon.
+
+
+Cathy spoke about the asymmetry of algorithms, where the people who own the code deploy it on others. Whereas algorithms are used by powerful people against the public, the public doesn’t have algorithms to use against the people with the code and the power. The public doesn’t know what algorithms are being used on them, and there’s no way to get any accountability or argue back against them. I’m not sure if something like this exists, but I think there should be a council, UN group, or some overseers that investigates AI usage and sets up some laws or regulations against harmful or inaccurate AI usage. How do we hold companies and the government accountable for what AI they use and how they use it? As AI usage increases and expands, the world should take strides in maintaining or initializing some sort of accountability.
+
+
+
+REMEMBER TO ADD YOUR GITHUB LINK AT THE TOP OF THE PAGE AND UNCOMMENT THE `knitr` OPTIONS.
+
+
